@@ -126,22 +126,6 @@ RC6 idle from 0% to 31%. Although 5-6x slower per file, the system no longer Ker
 
 ---
 
-## 🔧 Quick Commands
-
-```bash
-# Check build status
-python rag/build_index.py --status
-
-# Build Tang poetry collection
-python rag/build_index.py --col quantangshi_tang
-
-# Force rebuild
-python rag/build_index.py --col quantangshi_tang --rebuild
-
-# Monitor build process
-ps aux | grep build_index
-```
-
 ---
 
 # Intel GPU (Arc Pro 140T) AI 训练/推理保护指南
@@ -271,22 +255,8 @@ RC6 空闲率从 0% 升到 31%。虽然慢了 5-6 倍，但系统再也不会 Ke
 | CPU INT8, batch=10 | ~10min | ✅ 绝对稳定 | 备用方案 |
 | NPU INT8 | 待测 | 需静态 shape | 后续优化 |
 
-## 🔧 快速命令
-
-```bash
-# 查看建库状态
-python rag/build_index.py --status
-
-# 建唐诗主库
-python rag/build_index.py --col quantangshi_tang
-
-# 强制重建
-python rag/build_index.py --col quantangshi_tang --rebuild
-
-# 查看进程
-ps aux | grep build_index
-```
+---
 
 > 最后更新: 2026-05-29
 > 经验: Linux 比 Windows 更稳，但仍会出现 kernel panic。
-> INT8 + 频繁冷却是当前最稳定的方案。
+
