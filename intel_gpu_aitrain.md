@@ -117,27 +117,6 @@ RC6 idle from 0% to 31%. Although 5-6x slower per file, the system no longer Ker
 
 ---
 
-## 📊 GPU 占用前后对比（优化效果）
-
-> 数据来源: `sudo intel_gpu_top -s 1000` 连续采集 70s
-注：OpenVINO GPU 推理走 **Render/3D (RCS)** 引擎，不走 Compute (CCS) 引擎。
-
-| 指标 | 优化前（INT4, batch=20, 无冷却） | 优化后（INT8, batch=10, 有冷却） |
-|------|------|------|
-| **GPU Compute/Render 占用** | Render/3D > **90%** 持续满载 | Render/3D 峰值 **~19%**，均值 **2.3%** |
-| **GPU 频率 (实际)** | 持续高频 ~1800 MHz | 均值 **456 MHz**，峰值 **2151 MHz**（爆发的瞬间） |
-| **GPU 功耗** | 持续高功耗，易过热 | 均值 **2.9W**，峰值 **20.8W**（爆发后迅速回落） |
-| **Package 功耗** | 持续 ~30W+ | 均值 **14.8W**，峰值 **23.4W** |
-| **RC6 空闲比例** | ~0%（从不休息） | **~31%**（大量空闲冷却时间） |
-| **NaN/Inf 输出** | ❌ 频繁出现 → 最终 Kernel Panic | ✅ 零 NaN、零崩溃 |
-| **单文件耗时 (1000首)** | ~60s（快但危险） | ~350s（慢但安全） |
-
-**结论：** 优化后 GPU 实际干活时间大幅减少，RCS 占用从 >90% 降到峰值 19%，
-RC6 空闲率从 0% 升到 31%，GPU 有了充分的喘息时间。虽然单文件慢了 5-6 倍，
-但系统再也不会 Kernel Panic 了。
-
----
-
 | Config | Speed (1000 poems) | Stability | Notes |
 |--------|-------------------|-----------|-------|
 | GPU INT4, batch=20 | ~60s | ❌ Kernel panic | Do not use |
