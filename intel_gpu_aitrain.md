@@ -71,13 +71,13 @@ The GPU metrics in the comparison table below were collected using `intel_gpu_to
 
 In our tests, NaN/Inf values in inference output did **not** appear to be a quantization precision issue — instead, they consistently preceded GPU driver crashes. After implementing active cooling, NaN disappeared completely even with the same INT8 model. This suggests the root cause in our case was GPU overheating / power constraints, not numerical precision. Other users may have different experiences.
 
-### 2. OpenVINO Used the Render/3D Engine on This Platform
+### 2. OpenVINO Used the Compute Engine on This Platform
 
-On our test system, OpenVINO ran inference on the **Render/3D (RCS)** engine, not the Compute (CCS) engine. When monitoring GPU utilization, we found that `RCS` busy % was the relevant metric (not `CCS`). This may vary by GPU architecture and driver version.
+On our test system, OpenVINO ran inference on the **Compute (CCS)** engine. When monitoring GPU utilization, `CCS` busy % was the relevant metric. This may vary by GPU architecture, driver version, or OpenVINO plugin implementation.
 
-### 3. INT8 Was More Stable Than INT4 (on this GPU)
+### 3. Crashes Were Caused by Sustained High Load, Not Quantization Format
 
-In our experiments, INT4 quantization led to crashes under sustained load. Switching to INT8 eliminated crashes. This may be specific to how this GPU handles INT4 compute operations — other Intel Arc SKUs or driver versions may behave differently.
+In our experiments, both INT4 and INT8 configurations crashed under sustained high GPU utilization (>90%). The key variable was GPU load level and duration, not the quantization format. After introducing batch-size limits and cooldown intervals, the INT8 configuration ran stably. It remains unclear whether INT4 with the same protection measures would also be stable — quantization format may still play a secondary role.
 
 ---
 
@@ -87,7 +87,7 @@ In our experiments, INT4 quantization led to crashes under sustained load. Switc
 
 | Metric | Before (INT4, batch=20, no cooling) | After (INT8, batch=10, with cooling) |
 |--------|-------------------------------------|--------------------------------------|
-| GPU Render/3D usage | > **90%** sustained | Peak **~19%**, avg **2.3%** |
+| GPU Compute (CCS) usage | > **90%** sustained | Peak **~19%**, avg **2.3%** |
 | GPU freq (actual) | Sustained ~1800 MHz | Avg **456 MHz**, peak **2151 MHz** |
 | GPU power | Sustained high → overheating | Avg **2.9 W**, peak **20.8 W** |
 | RC6 idle ratio | ~**0%** (never rests) | **~31%** (frequent cooling breaks) |
@@ -114,9 +114,9 @@ On the tested platform and with the tested models, the following strategies help
 - **Small batches** appeared to prevent power spikes
 - **Frequent breaks** between batches gave the GPU time to cool
 - **Thermal detection via latency monitoring** caught throttling early and triggered extra cooldown
-- **INT8 quantization** avoided the crashes seen with INT4
+- **INT8 quantization** combined with load limits and cooldown intervals achieved stable operation (INT4 alone was not tested with these protections)
 
-Without these measures, sustained GPU load >90% eventually triggered a driver crash. These findings may or may not apply to other Intel Arc configurations.
+Without these measures, sustained GPU load >90% eventually triggered a driver crash regardless of quantization format. These findings may or may not apply to other Intel Arc configurations.
 
 ---
 
@@ -186,13 +186,13 @@ Without these measures, sustained GPU load >90% eventually triggered a driver cr
 
 在本测试中，NaN/Inf 输出**并非量化精度问题**，而是 GPU 驱动即将崩溃的前兆。加入主动冷却后，同一 INT8 模型的 NaN 完全消失。说明我们遇到的根因是 GPU 过热/供电受限，而非数值精度。其它配置下可能不同。
 
-### 2. 本次测试中 OpenVINO 使用 Render/3D 引擎
+### 2. 本次测试中 OpenVINO 使用 Compute 引擎
 
-在我们的系统上，OpenVINO 的推理走 **Render/3D (RCS)** 引擎，不走 Compute (CCS) 引擎。因此监控时应关注 `RCS` 占用率。不同 GPU 架构和驱动版本可能不同。
+在我们的系统上，OpenVINO 的推理走 **Compute (CCS)** 引擎。监控时应关注 `CCS` 占用率。不同 GPU 架构、驱动版本或 OpenVINO 插件实现可能不同。
 
-### 3. 本测试中 INT8 比 INT4 更稳定
+### 3. 崩溃由持续高负载引起，而非量化格式本身
 
-在我们的实验中，INT4 量化在持续负载下导致崩溃。切换为 INT8 后崩溃消失。这可能与当前 GPU 处理 INT4 计算的方式有关——其它 Intel Arc 型号或驱动版本可能表现不同。
+在我们的实验中，INT4 和 INT8 配置在持续高 GPU 占用率（>90%）下均出现崩溃。关键变量是 GPU 负载水平和持续时间，而非量化格式。加入 batch 限制和冷却间隔后，INT8 配置实现了稳定运行。目前尚不清楚 INT4 在同等保护措施下是否也能稳定——量化格式可能起次要作用。
 
 ---
 
@@ -202,7 +202,7 @@ Without these measures, sustained GPU load >90% eventually triggered a driver cr
 
 | 指标 | 优化前 (INT4, batch=20, 无冷却) | 优化后 (INT8, batch=10, 有冷却) |
 |------|--------------------------------|-------------------------------|
-| GPU Render/3D 占用 | > **90%** 持续满载 | 峰值 **~19%**，均值 **2.3%** |
+| GPU Compute (CCS) 占用 | > **90%** 持续满载 | 峰值 **~19%**，均值 **2.3%** |
 | GPU 实际频率 | 持续 ~1800 MHz | 均值 **456 MHz**，峰值 **2151 MHz** |
 | GPU 功耗 | 持续高负载 → 过热 | 均值 **2.9 W**，峰值 **20.8 W** |
 | RC6 空闲比例 | ~**0%**（从不休息） | **~31%**（频繁冷却） |
@@ -229,9 +229,9 @@ Without these measures, sustained GPU load >90% eventually triggered a driver cr
 - **小 batch** 可能避免了瞬时功耗尖峰
 - **频繁间歇** 让 GPU 有充分冷却时间
 - **通过推理延迟监测温度**，在降频初期及时触发额外冷却
-- **INT8 量化** 避免了 INT4 下的崩溃
+- **INT8 量化 + 负载限制 + 冷却间隔** 的组合实现了稳定运行（尚未在同等保护下测试 INT4）
 
-如果不采取这些措施，GPU 在 >90% 占用率下持续运行最终触发了驱动崩溃。这些发现不保证适用于其它 Intel Arc 配置。
+如果不采取这些措施，无论采用何种量化格式，GPU 在 >90% 占用率下持续运行最终触发了驱动崩溃。这些发现不保证适用于其它 Intel Arc 配置。
 
 ---
 
