@@ -1,262 +1,192 @@
-# Intel GPU (Arc Pro 140T) AI Training/Inference Protection Guide
+# Intel Arc GPU Stability Guide for AI Workloads
 
-> **Device:** Intel Arc Pro 130T/140T (Arrow Lake-P) — PCI ID `8086:7d51`
-> **NPU:** Intel AI Boost (`/dev/dri/renderD128`)
-> **OS:** Ubuntu 26.04 LTS, Kernel `7.0.0-15-generic`
-> **OpenVINO:** `2026.1.0` (releases/2026/1)
-> **PyTorch:** `2.12.0+xpu` (XPU available)
-> **oneAPI:** `2026.0` (compiler, MKL, DNNL, TBB)
-> **llama.cpp:** `b9404` (SYCL backend, IntelLLVM 2026.0.0)
-> **intel-gpu-tools:** `libze-intel-gpu1 26.14.37833.4`
+[![Ubuntu](https://img.shields.io/badge/OS-Ubuntu%2026.04%20LTS-E95420)](https://ubuntu.com/)
+[![Kernel](https://img.shields.io/badge/Kernel-7.0.0--15--generic-blue)](https://kernel.org/)
+[![OpenVINO](https://img.shields.io/badge/OpenVINO-2026.1-00A3E0)](https://docs.openvino.ai/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.12+xpu-EE4C2C)](https://pytorch.org/)
+
+**A practical guide to preventing GPU driver crashes (Kernel Panic, Segfault) on Intel Arc discrete GPUs under sustained AI inference workloads.**
 
 ---
 
-## ⚠️ Known Risks
+## Platforms & Models Tested
 
-| Risk | Symptom | Root Cause |
-|------|---------|------------|
-| **Kernel Panic** | System freeze, hard reboot required | GPU sustained high load triggers driver crash |
-| **Segfault (139)** | Process exits with code 139 | GPU memory access violation or driver bug |
-| **NaN/Inf Output** | NaN values in tensors, usually precedes kernel panic | **GPU driver is about to crash** (not quantization error) |
-| **Throttling** | Inference speed drops 2-5x suddenly | GPU temperature too high, auto-downclocking |
-| **Power Spike** | Whole system performance drops | Instant power draw exceeds PSU limit |
+| Category | Details |
+|----------|---------|
+| **GPU** | Intel Arc Pro 130T/140T (Arrow Lake-P, PCI ID `8086:7d51`) |
+| **NPU** | Intel AI Boost (`/dev/dri/renderD128`) |
+| **RAM** | 64 GB |
+| **OS** | Ubuntu 26.04 LTS |
+| **Kernel** | `7.0.0-15-generic` |
+| **Frameworks** | OpenVINO `2026.1`, PyTorch `2.12.0+xpu`, llama.cpp `b9404` (SYCL) |
+| **Compiler** | oneAPI `2026.0` (IntelLLVM, MKL, DNNL, TBB) |
+| **GPU driver** | `libze-intel-gpu1 26.14.37833.4` |
 
----
-
-## 🛡️ Protection Layers (5-Layer Defense)
-
-### Layer 1: Active Cooling (Root Cause Fix)
-
-**Key insight: NaN is NOT a quantization precision issue — it's a warning that the GPU driver is about to crash.**
-After adding cooling mechanisms, NaN disappeared completely (INT8 *with* cooling = no NaN; INT8 *without* cooling = NaN).
-This proves the root cause is GPU overheating / power starvation.
-
-Configuration (`rag/config.py`):
-```python
-BATCH_SIZE = 10                # Small batches reduce power spikes
-BATCH_COOLDOWN_INTERVAL = 3    # Cool down every 3 batches
-BATCH_COOLDOWN_SECONDS = 5     # 5s short break
-FILE_COOLDOWN_SECONDS = 30     # 30s break after each file
-CRASH_COOLDOWN = 60            # 60s recovery after crash
-```
-
-### Layer 2: Thermal Detection
-
-```python
-# embedding.py — detect throttling by inference time
-if bt > baseline * THERMAL_THROTTLE_FACTOR:  # current > 2x baseline
-    time.sleep(30)  # extra 30s cooling
-    baseline = (baseline + bt) / 2  # update baseline
-```
-
-Intel GPU has no userspace temperature API (`intel_gpu_top` requires root).
-**Using inference latency as a proxy for temperature** is the most practical approach.
-
-### Layer 3: Crash Recovery
-
-```python
-# embedding.py — self-healing on crash
-for attempt in range(3):
-    try:
-        out = compiled(...)   # inference
-        break
-    except Exception:
-        time.sleep(10)
-        _load_model()         # recompile model
-else:
-    raise RuntimeError("3 consecutive crashes, skip this batch")
-
-# build_index.py — file-level isolation
-try:
-    embeddings = embed.encode(docs)  # one file fails
-except Exception:
-    time.sleep(60)                   # cooldown
-    # continue to next file, don't abort
-```
-
-### Layer 4: GPU Health Check
-
-```python
-# embedding.py — probe GPU every 10 batches
-def health_check(self):
-    try:
-        compiled(["。"])  # minimal inference to verify GPU
-        return True
-    except Exception:
-        return False
-```
-
-### Layer 5: NaN Guard
-
-```python
-# embedding.py — _clean() catches NaN before ChromaDB rejects them
-def _clean(tensor):
-    if not np.isfinite(tensor).all():
-        tensor = np.nan_to_num(tensor, nan=0.0)
-        return tensor
-```
+| Model | Task | Format | Size |
+|-------|------|--------|------|
+| **Qwen3-Embedding-4B** | Text embedding (2560-dim) | OpenVINO INT8 | ~3 GB |
+| **Qwen3-Reranker-4B** | Text reranking | OpenVINO INT8 | ~3 GB |
+| **Qwen3.5-4B** | Text generation | GGUF (IQ4_XS) | ~2.5 GB |
 
 ---
 
-## 📊 Before/After GPU Usage Comparison
+## The Problem
 
-> Data: `sudo intel_gpu_top -s 1000`, 70s continuous sampling
-Note: OpenVINO GPU inference uses the **Render/3D (RCS)** engine, not the Compute (CCS) engine.
+Under sustained AI inference workloads (e.g., batch-encoding thousands of text passages), Intel Arc GPUs are prone to:
+
+- **Kernel Panic** – Complete system freeze requiring hard reboot
+- **Segfault (exit code 139)** – Process crashes from GPU memory access violation
+- **NaN/Inf Output** – GPU outputs garbage values before crashing
+- **Throttling** – Inference speed drops 2–5× due to thermal downclocking
+
+**Root cause:** Intel Arc consumer GPUs lack robust thermal/power management for sustained compute loads. The GPU driver becomes unstable when running at high utilization (>90%) for extended periods.
+
+---
+
+## Key Findings
+
+### 1. NaN Output is a Crash Warning
+
+NaN/Inf values in inference output are **not a quantization precision issue** — they are a **precursor to GPU driver crash**. After implementing active cooling, NaN disappeared completely even with the same INT8 model. This confirms the root cause is GPU overheating / power starvation, not numerical precision.
+
+### 2. OpenVINO Uses Render/3D Engine
+
+On Intel Arc GPUs, OpenVINO runs inference on the **Render/3D (RCS)** engine, not the Compute (CCS) engine. Monitor `RCS` busy %, not `CCS`.
+
+### 3. INT8 > INT4 for Stability
+
+INT4 quantization increases numerical edge-case behavior on Intel GPUs, making NaN/crash more likely. INT8 provides reliable stability with acceptable performance.
+
+---
+
+## Before / After Comparison
+
+### GPU Workload Metrics
 
 | Metric | Before (INT4, batch=20, no cooling) | After (INT8, batch=10, with cooling) |
-|--------|-------|------|
-| **GPU Render/3D usage** | > **90%** sustained full load | Peak **~19%**, avg **2.3%** |
-| **GPU frequency (actual)** | Sustained ~1800 MHz | Avg **456 MHz**, peak **2151 MHz** |
-| **GPU power** | Sustained high, easily overheats | Avg **2.9W**, peak **20.8W** |
-| **RC6 idle ratio** | ~0% (never rests) | **~31%** (frequent cooling breaks) |
-| **NaN/Inf output** | ❌ Frequent → Kernel Panic | ✅ Zero NaN, zero crashes |
-| **Time per file (1000 poems)** | ~60s (fast but dangerous) | ~350s (slow but safe) |
+|--------|-------------------------------------|--------------------------------------|
+| GPU Render/3D usage | > **90%** sustained | Peak **~19%**, avg **2.3%** |
+| GPU freq (actual) | Sustained ~1800 MHz | Avg **456 MHz**, peak **2151 MHz** |
+| GPU power | Sustained high → overheating | Avg **2.9 W**, peak **20.8 W** |
+| RC6 idle ratio | ~**0%** (never rests) | **~31%** (frequent cooling breaks) |
+| NaN/Inf output | ❌ Frequent → Kernel Panic | ✅ Zero NaN, zero crashes |
+| Time per 1000 texts | ~**60 s** (fast but dangerous) | ~**350 s** (slow but safe) |
 
-**Conclusion:** After optimization, GPU actual workload dropped significantly — RCS usage from >90% to peak 19%,
-RC6 idle from 0% to 31%. Although 5-6x slower per file, the system no longer Kernel Panics.
+**Data source:** `sudo intel_gpu_top -s 1000`, 70-second continuous sampling during embedding inference.
 
----
+### Stability Comparison
 
-| Config | Speed (1000 poems) | Stability | Notes |
-|--------|-------------------|-----------|-------|
-| GPU INT4, batch=20 | ~60s | ❌ Kernel panic | Do not use |
-| **GPU INT8, batch=10 + cooling** | **~350s** | **✅ Stable** | **Recommended** |
-| CPU INT8, batch=10 | ~10min | ✅ Rock solid | Fallback |
-| NPU INT8 | TBD | Needs static shapes | Future optimization |
-
----
+| Config | Speed (1000 texts) | Stability | Verdict |
+|--------|-------------------|-----------|---------|
+| GPU INT4, batch=20 | ~60 s | ❌ Kernel panic | Do not use |
+| **GPU INT8, batch=10 + cooling** | **~350 s** | **✅ Stable** | **Recommended** |
+| CPU INT8, batch=10 | ~10 min | ✅ Rock solid | Fallback |
+| NPU INT8 | TBD | Needs static shapes | Future |
 
 ---
 
-# Intel GPU (Arc Pro 140T) AI 训练/推理保护指南
+## Summary
 
-> **设备:** Intel Arc Pro 130T/140T (Arrow Lake-P) — PCI ID `8086:7d51`
-> **系统:** Ubuntu 26.04 LTS, 内核 `7.0.0-15-generic`
-> **OpenVINO:** `2026.1.0`
-> **PyTorch:** `2.12.0+xpu`
-> **oneAPI:** `2026.0`
-> **llama.cpp:** `b9404` (SYCL)
-> **intel-gpu-tools:** `26.14.37833.4`
+Intel Arc GPUs can handle AI inference workloads reliably when **active cooling** is employed:
 
----
+- **Small batches** prevent power spikes
+- **Frequent breaks** between batches give the GPU time to cool
+- **Thermal detection via latency monitoring** catches throttling early and triggers extra cooldown
+- **INT8 quantization** avoids numerical edge cases
 
-## ⚠️ 已知风险
-
-| 风险 | 现象 | 原因 |
-|------|------|------|
-| **Kernel Panic** | 系统完全死机，需硬重启 | GPU 持续高负载导致驱动级崩溃 |
-| **段错误 (Segfault)** | 进程退出码 139 | 显存访问越界或驱动 bug |
-| **NaN/Inf 输出** | 向量出现 NaN，随后可能 kernel panic | **GPU 驱动濒临崩溃的前兆**，非量化精度问题 |
-| **降频 (Throttling)** | 推理速度突然变慢 2-5x | GPU 温度过高自动降频 |
-| **供电不足** | 整机性能下降 | 瞬时功耗超过供电极限 |
+Without these measures, sustained GPU load >90% will eventually trigger a driver crash — regardless of operating system (Linux is more stable than Windows, but still susceptible).
 
 ---
 
-## 🛡️ 保护措施（五层防御）
+# Intel Arc GPU AI 负载稳定性指南
 
-### 第一层：主动冷却（治本）
-
-**关键认识：NaN 不是量化精度问题，而是 GPU 即将崩溃的前兆信号。**
-加了冷却机制后 NaN 自动消失（INT8 加冷却前有 NaN，加冷却后没有），
-说明根因是 GPU 过热/供电不足导致驱动输出异常。
-
-配置参数 (`rag/config.py`):
-```python
-BATCH_SIZE = 10                # 小 batch，减少瞬时功耗
-BATCH_COOLDOWN_INTERVAL = 3    # 每 3 个 batch 冷却 5s
-BATCH_COOLDOWN_SECONDS = 5
-FILE_COOLDOWN_SECONDS = 30     # 每个文件后冷却 30s
-CRASH_COOLDOWN = 60            # 崩溃后冷却 60s
-```
-
-### 第二层：降频检测
-
-```python
-# embedding.py - 每个 batch 后检测推理时间
-if bt > baseline * THERMAL_THROTTLE_FACTOR:  # 当前 > 基准 2 倍
-    time.sleep(30)  # 额外冷却 30s
-    baseline = (baseline + bt) / 2  # 更新基准
-```
-
-因为 Intel GPU 没有用户态温度读取接口（`intel_gpu_top` 需要 root），
-**用推理耗时反推温度**是最实用的方法。
-
-### 第三层：崩溃恢复
-
-```python
-# embedding.py - 崩溃自愈
-for attempt in range(3):
-    try:
-        out = compiled(...)   # 推理
-        break
-    except Exception:
-        time.sleep(10)
-        _load_model()         # 重新编译模型
-else:
-    raise RuntimeError("连续 3 次崩溃，跳过该 batch")
-
-# build_index.py - 文件级隔离
-try:
-    embeddings = embed.encode(docs)  # 一个文件失败
-except Exception:
-    time.sleep(60)                   # 冷却一分钟
-    # 继续下一个文件，不中断整体流程
-```
-
-### 第四层：GPU 探活
-
-```python
-# embedding.py - 每 10 个 batch 检查 GPU
-def health_check(self):
-    try:
-        compiled(["。"])  # 做一次极简推理
-        return True
-    except Exception:
-        return False
-```
-
-### 第五层：NaN 兜底
-
-```python
-# embedding.py - 在 ChromaDB 拒绝之前清理 NaN
-def _clean(tensor):
-    if not np.isfinite(tensor).all():
-        tensor = np.nan_to_num(tensor, nan=0.0)
-        return tensor
-```
+**在 Intel Arc 独立显卡上，防止长时间 AI 推理负载导致 GPU 驱动崩溃（Kernel Panic、段错误）的实践指南。**
 
 ---
 
-## 📊 GPU 占用前后对比（优化效果）
+## 测试平台与模型
 
-> 数据来源: `sudo intel_gpu_top -s 1000` 连续采集 70s  
-> 注：OpenVINO GPU 推理走 **Render/3D (RCS)** 引擎，不走 Compute (CCS) 引擎。
+| 类别 | 详情 |
+|------|------|
+| **GPU** | Intel Arc Pro 130T/140T (Arrow Lake-P, PCI ID `8086:7d51`) |
+| **NPU** | Intel AI Boost (`/dev/dri/renderD128`) |
+| **内存** | 64 GB |
+| **系统** | Ubuntu 26.04 LTS |
+| **内核** | `7.0.0-15-generic` |
+| **框架** | OpenVINO `2026.1`, PyTorch `2.12.0+xpu`, llama.cpp `b9404` (SYCL) |
+| **编译器** | oneAPI `2026.0` (IntelLLVM, MKL, DNNL, TBB) |
+| **GPU 驱动** | `libze-intel-gpu1 26.14.37833.4` |
 
-| 指标 | 优化前（INT4, batch=20, 无冷却） | 优化后（INT8, batch=10, 有冷却） |
-|------|------|------|
-| **GPU Render/3D 占用** | > **90%** 持续满载 | 峰值 **~19%**，均值 **2.3%** |
-| **GPU 频率** | 持续高频 ~1800 MHz | 均值 **456 MHz**，峰值 **2151 MHz** |
-| **GPU 功耗** | 持续高功耗，易过热 | 均值 **2.9W**，峰值 **20.8W** |
-| **RC6 空闲比例** | ~0%（从不休息） | **~31%**（大量空闲冷却） |
-| **NaN/Inf 输出** | ❌ 频繁出现 → Kernel Panic | ✅ 零 NaN、零崩溃 |
-| **单文件耗时 (1000首)** | ~60s（快但危险） | ~350s（慢但安全） |
-
-**结论：** 优化后 GPU 实际干活时间大幅减少，RCS 占用从 >90% 降到峰值 19%，
-RC6 空闲率从 0% 升到 31%。虽然慢了 5-6 倍，但系统再也不会 Kernel Panic 了。
-
----
-
-## 📊 性能与稳定性权衡
-
-| 配置 | 速度 (1000首) | 稳定性 | 适用场景 |
-|------|-------------|--------|---------|
-| GPU INT4, batch=20 | ~60s | ❌ Kernel panic | 不推荐 |
-| GPU INT8, batch=10 + 冷却 | ~350s | ✅ 稳定运行 | 推荐建库 |
-| CPU INT8, batch=10 | ~10min | ✅ 绝对稳定 | 备用方案 |
-| NPU INT8 | 待测 | 需静态 shape | 后续优化 |
+| 模型 | 任务 | 格式 | 大小 |
+|------|------|------|------|
+| **Qwen3-Embedding-4B** | 文本向量化 (2560维) | OpenVINO INT8 | ~3 GB |
+| **Qwen3-Reranker-4B** | 文本排序 | OpenVINO INT8 | ~3 GB |
+| **Qwen3.5-4B** | 文本生成 | GGUF (IQ4_XS) | ~2.5 GB |
 
 ---
 
-> 最后更新: 2026-05-29
-> 经验: Linux 比 Windows 更稳，但仍会出现 kernel panic。
+## 问题描述
 
+在长时间 AI 推理负载下（如批量编码数千段文本），Intel Arc GPU 容易出现：
+
+- **Kernel Panic** — 系统完全死机，需要硬重启
+- **段错误 (exit code 139)** — 进程崩溃，显存访问异常
+- **NaN/Inf 输出** — GPU 在崩溃前输出异常值
+- **降频** — 推理速度骤降 2-5 倍
+
+**根本原因：** Intel Arc 消费级 GPU 缺乏针对长时间计算负载的热管理和供电管理机制。GPU 驱动在高占用率（>90%）下持续运行会变得不稳定。
+
+---
+
+## 关键发现
+
+### 1. NaN 输出是崩溃前兆
+
+推理结果中的 NaN/Inf **不是量化精度问题**，而是 **GPU 驱动即将崩溃的信号**。加入主动冷却后，同一 INT8 模型的 NaN 完全消失。证明根因是 GPU 过热/供电不足。
+
+### 2. OpenVINO 使用 Render/3D 引擎
+
+在 Intel Arc GPU 上，OpenVINO 的推理走 **Render/3D (RCS)** 引擎，不走 Compute (CCS) 引擎。监控时注意看 `RCS` 占用率。
+
+### 3. INT8 优于 INT4
+
+INT4 量化在 Intel GPU 上更容易触发数值边界情况，增加 NaN/崩溃风险。INT8 在保持可用性能的同时提供了可靠的稳定性。
+
+---
+
+## 优化前后对比
+
+### GPU 负载指标
+
+| 指标 | 优化前 (INT4, batch=20, 无冷却) | 优化后 (INT8, batch=10, 有冷却) |
+|------|--------------------------------|-------------------------------|
+| GPU Render/3D 占用 | > **90%** 持续满载 | 峰值 **~19%**，均值 **2.3%** |
+| GPU 实际频率 | 持续 ~1800 MHz | 均值 **456 MHz**，峰值 **2151 MHz** |
+| GPU 功耗 | 持续高负载 → 过热 | 均值 **2.9 W**，峰值 **20.8 W** |
+| RC6 空闲比例 | ~**0%**（从不休息） | **~31%**（频繁冷却） |
+| NaN/Inf 输出 | ❌ 频繁出现 → Kernel Panic | ✅ 零 NaN、零崩溃 |
+| 每千条耗时 | ~**60 s**（快但不稳） | ~**350 s**（慢但安全） |
+
+**数据来源：** `sudo intel_gpu_top -s 1000`，在 Embedding 推理过程中连续采集 70 秒。
+
+### 稳定性对比
+
+| 配置 | 速度 (千条) | 稳定性 | 结论 |
+|------|-----------|--------|------|
+| GPU INT4, batch=20 | ~60 s | ❌ Kernel panic | 不推荐 |
+| **GPU INT8, batch=10 + 冷却** | **~350 s** | **✅ 稳定** | **推荐** |
+| CPU INT8, batch=10 | ~10 min | ✅ 绝对稳定 | 备用 |
+| NPU INT8 | 待测 | 需静态 shape | 后续 |
+
+---
+
+## 总结
+
+Intel Arc GPU 在**主动冷却**策略下可以稳定运行 AI 推理负载：
+
+- **小 batch** 避免瞬时功耗尖峰
+- **频繁间歇** 让 GPU 有充分冷却时间
+- **通过推理延迟监测温度**，在降频初期及时触发额外冷却
+- **INT8 量化** 避免数值边界问题
+
+如果不采取这些措施，GPU 在 >90% 占用率下持续运行最终会导致驱动崩溃——无论操作系统如何（Linux 比 Windows 更稳定，但同样受影响）。
